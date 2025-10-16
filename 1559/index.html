@@ -43,10 +43,26 @@
   <!-- Babel -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
-  <script type="text/babel" data-presets="react,env">
-    const { useState, useMemo } = React;
+  <!-- Load simulation as global variable first -->
+  <script>
+    window.SimulationModule = null;
+    fetch('./simulation.js')
+      .then(r => r.text())
+      .then(code => {
+        const moduleExports = {};
+        const module = { exports: moduleExports };
+        const fn = new Function('module', 'exports', code);
+        fn(module, moduleExports);
+        window.SimulationModule = module.exports;
+      })
+      .catch(err => console.error('Failed to load simulation.js:', err));
+  </script>
 
-    // tiny inline emoji icons (keeps the file standalone)
+  <!-- Main app with JSX/Babel -->
+  <script type="text/babel">
+    const { useState, useMemo, useEffect } = React;
+
+    // Emoji icons
     const I = {
       Info: (p)=><span {...p}>ℹ️</span>,
       Users:(p)=><span {...p}>👥</span>,
@@ -60,34 +76,46 @@
       Laurel:(p)=><span {...p}>🏛️</span>,
     };
 
-    // Reusable info tooltip
+    // Enhanced info tooltip component with better styling
     const InfoTooltip = ({ title, children }) => (
-      <span className="group relative inline-flex items-center ml-2 align-middle">
-        <span className="text-slate-300">ℹ️</span>
-        <span className="tooltip-panel invisible group-hover:visible absolute w-80 p-3 mt-2 text-sm text-white bg-gray-800 rounded-lg shadow-lg -left-32">
-          <div className="font-semibold mb-1">{title}</div>
-          <div className="text-gray-300">{children}</div>
+      <span className="group relative inline-flex items-center ml-2 align-middle cursor-help">
+        <span className="text-slate-300 hover:text-slate-100 transition-colors">ℹ️</span>
+        <span className="tooltip-panel invisible group-hover:visible absolute w-96 p-4 mt-2 text-sm text-white bg-gray-900 border border-emerald-500/30 rounded-lg shadow-xl -left-40 z-50">
+          <div className="font-semibold mb-2 text-emerald-300">{title}</div>
+          <div className="text-gray-300 leading-relaxed">{children}</div>
         </span>
       </span>
     );
 
     function App() {
-      // ===== Constants =====
-      const GWEI_TO_ETC = 1e-9;
-      const M_GAS = 1_000_000;
+      // ===== ALL HOOKS AT TOP =====
+      const [Sim, setSim] = useState(null);
+      const [selectedScenarios, setSelectedScenarios] = useState(["classic","olympia","burn"]);
+      const [treasuryEnabled, setTreasuryEnabled] = useState(true);
+      const [selectedEra, setSelectedEra] = useState(4);
+      const [targetBlockSize, setTargetBlockSize] = useState(15);
+      const [demandLevel, setDemandLevel] = useState(20);
+      const [priceK, setPriceK] = useState(50);
+      const [initialBaseFee, setInitialBaseFee] = useState(50);
+      const [tipsGwei, setTipsGwei] = useState(2);
+      const [numBlocks, setNumBlocks] = useState(100_000);
+      const [capChoice, setCapChoice] = useState("500k");
+      const [use1559, setUse1559] = useState(true);
+      const [minerMode, setMinerMode] = useState("equal");
+      const [rngSeed, setRngSeed] = useState(1);
 
-      // ECIP-1017
-      const ERA_BLOCKS = 5_000_000;
-      const ERA_REDUCTION = 0.20;
-      const INITIAL_REWARD = 5;
-      const GENESIS_SUPPLY = 72_000_000; // baseline for supply calc
+      // Load simulation module
+      useEffect(() => {
+        const checkSim = setInterval(() => {
+          if (window.SimulationModule) {
+            setSim(window.SimulationModule);
+            clearInterval(checkSim);
+          }
+        }, 100);
+        return () => clearInterval(checkSim);
+      }, []);
 
-      // Base fee guards
-      const MAX_BASE_FEE_GWEI = 100_000;
-
-      const miners = 5;
-
-      // ===== Scenarios (raw) =====
+      // Scenarios definition
       const baseScenarios = {
         classic: {
           name:"EIP-1559 No Burn/Treasury",
@@ -121,9 +149,7 @@
         }
       };
 
-      const [selectedScenarios, setSelectedScenarios] = useState(["classic","olympia","burn"]);
-      const [treasuryEnabled, setTreasuryEnabled] = useState(true);
-
+      // All useMemo hooks
       const scenarios = useMemo(()=>{
         const out = {};
         for (const [k, s] of Object.entries(baseScenarios)) {
@@ -132,259 +158,94 @@
         return out;
       }, [treasuryEnabled]);
 
-      // ===== Era selection (radio buttons) =====
-      const [selectedEra, setSelectedEra] = useState(4);
-      const currentBlockHeight = selectedEra * ERA_BLOCKS;
-
-      // ===== Network params =====
-      const [targetBlockSize, setTargetBlockSize] = useState(15);
-      const [demandLevel, setDemandLevel] = useState(20);
-      const [priceK, setPriceK] = useState(50);
-      const [initialBaseFee, setInitialBaseFee] = useState(50);
-      const [tipsGwei, setTipsGwei] = useState(2);
-
-      // ===== Simulation length & safety =====
-      const [numBlocks, setNumBlocks] = useState(100_000);
-      const [capChoice, setCapChoice] = useState("500k"); // 500k | 2.5m | none
-      const safetyCap = capChoice==="500k" ? 500_000 : capChoice==="2.5m" ? 2_500_000 : Infinity;
-      const [use1559, setUse1559] = useState(true);
-
-      const maxBlockSize = use1559 ? targetBlockSize * 2 : targetBlockSize;
-
-      // ===== Monetary helpers =====
-      const rewardForEra = (era) => INITIAL_REWARD * Math.pow(1 - ERA_REDUCTION, era);
-      const issuedThroughFullEras = (era) => {
-        if (era <= 0) return 0;
-        const r = 1 - ERA_REDUCTION;
-        return ERA_BLOCKS * INITIAL_REWARD * ((1 - Math.pow(r, era)) / (1 - r));
-      };
-      const issuanceAtBlock = (h) => {
-        const era = Math.floor(h / ERA_BLOCKS);
-        const inEra = h % ERA_BLOCKS;
-        return issuedThroughFullEras(era) + inEra * rewardForEra(era);
-      };
-      const supplyFromHeight = (h) => GENESIS_SUPPLY + issuanceAtBlock(h);
-
-      const startingSupply = useMemo(()=> supplyFromHeight(currentBlockHeight), [currentBlockHeight]);
-
-      // Era snapshot
-      const eraReward = rewardForEra(selectedEra);
-      const eraStart = currentBlockHeight;
-      const eraEnd = eraStart + ERA_BLOCKS - 1;
-      const eraStartSupply = startingSupply;
-      const eraEndSupply = eraStartSupply + ERA_BLOCKS * eraReward;
-
-      // ===== Miner distribution =====
-      const [minerMode, setMinerMode] = useState("equal"); // equal | weighted | automaton
-      const [rngSeed, setRngSeed] = useState(1);
-
-      // ===== Demand & base fee =====
-      const safeNum = (x, fb=0)=> Number.isFinite(x) ? x : fb;
-
-      const updateBaseFee = (prev, gasUsed, targetGas) => {
-        if (!use1559) return 0;
-        const delta = gasUsed - targetGas;
-        if (delta === 0) return prev;
-        const maxChangeDen = 8; // ±12.5%
-        const amount = Math.floor((Math.abs(prev) * Math.abs(delta)) / Math.max(1, targetGas) / maxChangeDen);
-        let next = delta > 0 ? prev + Math.max(1, amount) : prev - Math.max(1, amount);
-        if (next < 0) next = 0;
-        if (next > MAX_BASE_FEE_GWEI) next = MAX_BASE_FEE_GWEI; // clamp (prevents Infinity issues)
-        return next;
-      };
-
-      const demandAfterPrice = (baselineMgas, baseFeeGwei) => {
-        // simple price elasticity: demand shrinks as base fee rises relative to K
-        const factor = 1 / (1 + safeNum(baseFeeGwei / Math.max(1e-9, priceK), 0));
-        return Math.max(0, baselineMgas * factor);
-      };
-
-      // RNG / miners
-      const makeLCG = (seed) => {
-        let s = seed >>> 0;
-        return () => { s = (1664525 * s + 1013904223) >>> 0; return s / 0xffffffff; };
-      };
-      const pickWeightedMiner = (rand) => {
-        const r = rand();
-        if (r < 0.40) return 0;
-        if (r < 0.70) return 1;
-        if (r < 0.90) return 2;
-        if (r < 0.95) return 3;
-        return 4;
-      };
-      const pickEqualMiner = (i) => i % miners;
-
-      const RULE_110 = (n) =>
-        n===0b111?0 : n===0b110?1 : n===0b101?1 : n===0b100?0 :
-        n===0b011?1 : n===0b010?1 : n===0b001?1 : 0;
-
-      const makeRule110Picker = (seed) => {
-        const rand = makeLCG(seed);
-        const N=32;
-        let state = Array.from({length:N},()=> rand()<0.5?1:0);
-        const churn = Array.from({length:miners},(_,m)=>({
-          phase:Math.floor(rand()*200), period:400+m*37, window:40+m*7
-        }));
-        let t=0;
-        const active=(m)=>{
-          const {phase,period,window} = churn[m];
-          const x=(t+phase)%period;
-          return !(x<window); // inactive in the small window, otherwise active
-        };
-        return ()=>{
-          const next = new Array(N);
-          for(let i=0;i<N;i++){
-            const L=state[(i-1+N)%N], C=state[i], R=state[(i+1)%N];
-            next[i]=RULE_110((L<<2)|(C<<1)|R);
-          }
-          state=next;
-          let h=0; for(let i=0;i<N;i++) h=(h*131+state[i])>>>0;
-          let idx=h%miners;
-          if(!active(idx)){
-            for(let k=0;k<miners;k++){ idx=(idx+1)%miners; if(active(idx)) break; }
-          }
-          t++;
-          return idx;
-        };
-      };
-
-      // ===== Simulation (summary only) =====
-      function simulateSummary(scenario) {
-        const requested = Math.max(0, numBlocks);
-        const n = Math.min(requested, safetyCap, ERA_BLOCKS);
-        if (n === 0) {
-          return {
-            summary:{
-              simulatedBlocks:0, totalEmitted:0,totalBurned:0,totalToContract:0,totalMinerRevenue:0,
-              totalBaseFeeRevenue:0, avgBaseFee:use1559?initialBaseFee:0, avgBaseFeeRevenue:0,
-              finalSupply: startingSupply, netSupplyChange:0, avgBlockReward:0, avgBaseFeeToMiner:0,
-              avgTips:0, avgPayForward:0, avgMinerRevenue:0, perMiner:Array.from({length:miners},(_,i)=>({
-                miner:i+1, blocksWon:0, avgRevenuePerWonBlock:0, totalRevenue:0
-              }))
-            }
-          };
-        }
-
-        const minerRev = new Array(miners).fill(0);
-        const minerBlocks = new Array(miners).fill(0);
-
-        const rand = makeLCG(rngSeed);
-        const pickAutomaton = makeRule110Picker(rngSeed);
-        const pickWinner = (i) => {
-          if (minerMode==="equal") return pickEqualMiner(i);
-          if (minerMode==="weighted") return pickWeightedMiner(rand);
-          return pickAutomaton();
-        };
-
-        let baseFee = use1559 ? initialBaseFee : 0;
-        let totalSupply = startingSupply;
-        let h = currentBlockHeight;
-
-        let sumEmission=0, sumBurned=0, sumToContract=0, sumMinerRevenue=0, sumTips=0;
-        let sumImmediateBaseFeeToMiner=0, sumBaseFeeRevenue=0, sumPayForwardReceived=0, sumBaseFeePrice=0;
-
-        const buf = []; // ℓ-smoothing buffer
-
-        for (let i=0;i<n;i++){
-          const jitter = Math.sin(i/3)*3 + (Math.random()*2-1);
-          const priced = demandAfterPrice(Math.max(0, demandLevel + jitter), baseFee);
-          const blockSizeMGas = Math.min(priced, maxBlockSize);
-          const gasUsed = blockSizeMGas * M_GAS;
-
-          const era = Math.floor(h/ERA_BLOCKS);
-          const emission = rewardForEra(era);
-          const baseFeeRevenue = use1559 ? safeNum(baseFee * gasUsed * GWEI_TO_ETC) : 0;
-          const tipRevenue = safeNum(tipsGwei * gasUsed * GWEI_TO_ETC);
-
-          const burned = baseFeeRevenue * scenario.burnFraction;
-          const toContract = baseFeeRevenue * scenario.contractFraction;
-          const toPayForward = baseFeeRevenue * scenario.payForwardFraction;
-
-          // ℓ-smoothing
-          let payForwardReceived = 0;
-          if (scenario.ellWindow>0 && toPayForward>0){
-            buf.push({amount:toPayForward/scenario.ellWindow, blocksRemaining:scenario.ellWindow});
-          }
-          for (let k=0;k<buf.length;k++){
-            if (buf[k].blocksRemaining>0){
-              payForwardReceived += buf[k].amount;
-              buf[k].blocksRemaining--;
-            }
-          }
-          for (let k=buf.length-1;k>=0;k--){
-            if (buf[k].blocksRemaining<=0) buf.splice(k,1);
-          }
-
-          const immediateBaseFeeToMiner = baseFeeRevenue - burned - toContract - toPayForward;
-          const minerRevenue = emission + immediateBaseFeeToMiner + tipRevenue + payForwardReceived;
-
-          const m = pickWinner(i);
-          minerBlocks[m] += 1;
-          minerRev[m] += minerRevenue;
-
-          // supply
-          const netEmission = emission - burned;
-          totalSupply += netEmission;
-
-          // sums
-          sumEmission += emission;
-          sumBurned += burned;
-          sumToContract += toContract;
-          sumMinerRevenue += minerRevenue;
-          sumTips += tipRevenue;
-          sumImmediateBaseFeeToMiner += immediateBaseFeeToMiner;
-          sumBaseFeeRevenue += baseFeeRevenue;
-          sumPayForwardReceived += payForwardReceived;
-          sumBaseFeePrice += baseFee;
-
-          baseFee = updateBaseFee(baseFee, gasUsed, targetBlockSize * M_GAS);
-          h++;
-        }
-
-        const perMiner = minerRev.map((rev,i)=>({
-          miner:i+1, blocksWon:minerBlocks[i],
-          avgRevenuePerWonBlock: minerBlocks[i] ? rev/minerBlocks[i] : 0,
-          totalRevenue:rev
-        }));
-
+      const simulationConstants = useMemo(() => {
+        if (!Sim) return { ERA_BLOCKS: 5_000_000, NUM_MINERS: 5, GENESIS_SUPPLY: 72_000_000 };
         return {
-          summary:{
-            simulatedBlocks:n,
-            totalEmitted:sumEmission,
-            totalBurned:sumBurned,
-            totalToContract:sumToContract,
-            totalMinerRevenue:sumMinerRevenue,
-            totalBaseFeeRevenue:sumBaseFeeRevenue,
-            avgBaseFee: n>0 ? (sumBaseFeePrice / n) : 0,
-            avgBaseFeeRevenue: n>0 ? (sumBaseFeeRevenue / n) : 0,
-            finalSupply: totalSupply,
-            netSupplyChange: totalSupply - startingSupply,
-            avgBlockReward: n>0 ? (sumEmission / n) : 0,
-            avgBaseFeeToMiner: n>0 ? (sumImmediateBaseFeeToMiner / n) : 0,
-            avgTips: n>0 ? (sumTips / n) : 0,
-            avgPayForward: n>0 ? (sumPayForwardReceived / n) : 0,
-            avgMinerRevenue: n>0 ? (sumMinerRevenue / n) : 0,
-            perMiner
-          }
+          ERA_BLOCKS: Sim.ERA_BLOCKS,
+          NUM_MINERS: Sim.NUM_MINERS,
+          GENESIS_SUPPLY: Sim.GENESIS_SUPPLY,
         };
-      }
+      }, [Sim]);
+
+      const currentBlockHeight = useMemo(() => selectedEra * simulationConstants.ERA_BLOCKS, [selectedEra, simulationConstants.ERA_BLOCKS]);
+      const safetyCap = useMemo(() => capChoice==="500k" ? 500_000 : capChoice==="2.5m" ? 2_500_000 : Infinity, [capChoice]);
+      
+      const startingSupply = useMemo(() => {
+        if (!Sim) return simulationConstants.GENESIS_SUPPLY;
+        return Sim.supplyFromHeight(currentBlockHeight);
+      }, [currentBlockHeight, Sim, simulationConstants.GENESIS_SUPPLY]);
 
       const scenarioResults = useMemo(()=>{
+        if (!Sim) {
+          const out = {};
+          for (const k of selectedScenarios) {
+            out[k] = { summary: { simulatedBlocks:0, totalEmitted:0, totalBurned:0, totalToContract:0, totalMinerRevenue:0, totalBaseFeeRevenue:0, avgBaseFee:0, avgBaseFeeRevenue:0, finalSupply: startingSupply, netSupplyChange:0, avgBlockReward:0, avgBaseFeeToMiner:0, avgTips:0, avgPayForward:0, avgMinerRevenue:0, perMiner:Array.from({length:simulationConstants.NUM_MINERS},(_,i)=>({miner:i+1, blocksWon:0, avgRevenuePerWonBlock:0, totalRevenue:0})) } };
+          }
+          return out;
+        }
+
         const out = {};
         for (const k of selectedScenarios) {
-          out[k] = simulateSummary(scenarios[k]);
+          const scenario = scenarios[k];
+          const requested = Math.max(0, numBlocks);
+          const n = Math.min(requested, safetyCap, simulationConstants.ERA_BLOCKS);
+          
+          if (n === 0) {
+            out[k] = { summary: { simulatedBlocks:0, totalEmitted:0, totalBurned:0, totalToContract:0, totalMinerRevenue:0, totalBaseFeeRevenue:0, avgBaseFee:use1559?initialBaseFee:0, avgBaseFeeRevenue:0, finalSupply: startingSupply, netSupplyChange:0, avgBlockReward:0, avgBaseFeeToMiner:0, avgTips:0, avgPayForward:0, avgMinerRevenue:0, perMiner:Array.from({length:simulationConstants.NUM_MINERS},(_,i)=>({miner:i+1, blocksWon:0, avgRevenuePerWonBlock:0, totalRevenue:0})) } };
+          } else {
+            try {
+              const summary = Sim.simulate({
+                startingBlockHeight: currentBlockHeight,
+                startingSupply,
+                numBlocks: n,
+                scenario,
+                targetBlockSize,
+                demandLevel,
+                priceK,
+                initialBaseFee,
+                tipsGwei,
+                use1559,
+                minerMode,
+                rngSeed
+              });
+              out[k] = { summary };
+            } catch (err) {
+              console.error('Simulation error:', err);
+              out[k] = { summary: { simulatedBlocks:0, totalEmitted:0, totalBurned:0, totalToContract:0, totalMinerRevenue:0, totalBaseFeeRevenue:0, avgBaseFee:0, avgBaseFeeRevenue:0, finalSupply: startingSupply, netSupplyChange:0, avgBlockReward:0, avgBaseFeeToMiner:0, avgTips:0, avgPayForward:0, avgMinerRevenue:0, perMiner:Array.from({length:simulationConstants.NUM_MINERS},(_,i)=>({miner:i+1, blocksWon:0, avgRevenuePerWonBlock:0, totalRevenue:0})) } };
+            }
+          }
         }
         return out;
-      }, [
-        selectedScenarios, scenarios, selectedEra, targetBlockSize, demandLevel,
-        priceK, initialBaseFee, tipsGwei, numBlocks, capChoice, use1559,
-        minerMode, rngSeed
-      ]);
+      }, [Sim, selectedScenarios, scenarios, selectedEra, targetBlockSize, demandLevel, priceK, initialBaseFee, tipsGwei, numBlocks, capChoice, use1559, minerMode, rngSeed, currentBlockHeight, safetyCap, startingSupply, simulationConstants.ERA_BLOCKS, simulationConstants.NUM_MINERS]);
+
+      // Conditional render for loading
+      if (!Sim) {
+        return (
+          <div className="max-w-7xl mx-auto p-6">
+            <div className="text-center">
+              <div className="text-2xl text-gray-300">Loading simulation engine...</div>
+            </div>
+          </div>
+        );
+      }
+
+      // Constants
+      const rewardForEra = Sim.rewardForEra;
+      const supplyFromHeight = Sim.supplyFromHeight;
+      const { ERA_BLOCKS, NUM_MINERS } = simulationConstants;
+
+      const toggleScenario = (key) => {
+        if (selectedScenarios.includes(key)) {
+          if (selectedScenarios.length>1) setSelectedScenarios(selectedScenarios.filter(s=>s!==key));
+        } else {
+          setSelectedScenarios([...selectedScenarios, key]);
+        }
+      };
 
       const ScenarioCard = ({ scenarioKey, scenario, isSelected, onClick }) => (
         <button
           onClick={() => onClick(scenarioKey)}
-          className={`panel greek-key p-4 rounded-lg border-2 transition-all text-left ${isSelected ? "border-emerald-500/70 bg-emerald-900/10" : "border-gray-700/60 bg-gray-900/40 hover:bg-gray-900/70"}`}
+          className={`panel greek-key p-4 rounded-lg border-2 transition-all text-left ${isSelected ? "border-emerald-500/70 bg-emerald-900/10" : "border-gray-700/60 bg-gray-900/40 hover:bg-gray-900/20"}`}
         >
           <div className="flex items-start gap-3">
             <span className="w-6 h-6 mt-1" style={{ color: scenario.color }}>{React.createElement(scenario.icon)}</span>
@@ -396,14 +257,6 @@
           </div>
         </button>
       );
-
-      const toggleScenario = (key) => {
-        if (selectedScenarios.includes(key)) {
-          if (selectedScenarios.length>1) setSelectedScenarios(selectedScenarios.filter(s=>s!==key));
-        } else {
-          setSelectedScenarios([...selectedScenarios, key]);
-        }
-      };
 
       const RewardFlow = ({ keyId }) => {
         const s = scenarios[keyId], sum = scenarioResults[keyId].summary;
@@ -529,8 +382,8 @@
               </div>
               <div className="grid grid-cols-2 gap-3 text-sm">
                 <div className="bg-gray-900/60 p-3 rounded border border-gray-800">
-                  <div className="text-gray-400 mb-1">Starting (derived)</div>
-                  <div className="font-semibold">{supplyFromHeight(selectedEra*5_000_000).toLocaleString()}</div>
+                  <div className="text-gray-400 mb-1">Starting</div>
+                  <div className="font-semibold">{supplyFromHeight(selectedEra*ERA_BLOCKS).toLocaleString()}</div>
                 </div>
                 <div className="bg-gray-900/60 p-3 rounded border border-gray-800">
                   <div className="text-gray-400 mb-1">Final</div>
@@ -556,28 +409,32 @@
         );
       };
 
-      // ===== Render =====
+      // ===== RENDER =====
       return (
         <div className="max-w-7xl mx-auto p-6">
           <div className="text-center mb-8">
             <div className="title-font text-4xl md:text-5xl font-bold mb-2 gold flex items-center justify-center gap-3">
               <I.Laurel/> ETC • OLYMPIA <span className="accent">Σ</span>CENARIOS <I.Laurel/>
             </div>
-            <p className="text-gray-300">
-              A community tool to explore EIP-1559 mechanics on ETC.
+            <p className="text-gray-300 mb-2">
+              A community tool to explore fee mechanism policies on Ethereum Classic
+            </p>
+            <p className="text-sm text-gray-400">
+              Compare how different revenue distribution models affect miners, supply, and ecosystem funding
             </p>
           </div>
 
-          {/* Top switches with tooltips */}
+          {/* Top switches */}
           <div className="grid md:grid-cols-2 gap-4 mb-8">
             <div className="panel greek-key rounded-lg p-4">
               <div className="flex items-center justify-between">
-                <div>
+                <div className="flex-1">
                   <div className="title-font text-lg gold flex items-center">
                     Fee Mechanism
-                    <InfoTooltip title="Fee Mechanism">
-                      <p className="mb-2"><strong>EIP-1559:</strong> Elastic block size around a target. Base fee adjusts ±12.5% per block depending on demand.</p>
-                      <p className="mb-1"><strong>Pre-1559:</strong> Fixed block gas limit, no base fee; only tips.</p>
+                    <InfoTooltip title="Fee Mechanism Overview">
+                      <p><strong>EIP-1559:</strong> Dynamic pricing where the base fee adjusts each block (±12.5%) based on demand. Blocks can expand to 2x the target if demand is high.</p>
+                      <p className="mt-2"><strong>Pre-1559:</strong> Fixed block size limit. No base fee mechanism—only miner tips.</p>
+                      <p className="mt-2">Use EIP-1559 to simulate modern fee markets. Use Pre-1559 to see legacy pricing behavior.</p>
                     </InfoTooltip>
                   </div>
                   <div className="text-sm text-gray-300">{use1559 ? "EIP-1559: Dynamic base fee + elastic blocks" : "Pre-1559: Fixed gas limit + tips only"}</div>
@@ -586,204 +443,200 @@
                   onClick={()=>setUse1559(!use1559)}
                   className={`px-5 py-2 rounded border ${use1559 ? "border-emerald-500 text-white bg-emerald-700/30" : "border-gray-600 text-gray-200 bg-gray-800"}`}
                 >
-                  {use1559 ? "EIP-1559 Active" : "Pre-1559 Mode"}
+                  {use1559 ? "EIP-1559" : "Pre-1559"}
                 </button>
               </div>
             </div>
 
             <div className="panel greek-key rounded-lg p-4">
               <div className="flex items-center justify-between">
-                <div>
+                <div className="flex-1">
                   <div className="title-font text-lg gold flex items-center">
-                    Olympia Treasury
+                    Treasury Support
                     <InfoTooltip title="Treasury Toggle">
-                      <p>Enable/disable sending a fraction of base fees to a treasury contract in scenarios that use it. Turning this off sets treasury share to 0% for those scenarios.</p>
+                      <p>Enable/disable ecosystem treasury funding. When enabled, a portion of base fees can be directed to a treasury contract to fund ETC development.</p>
+                      <p className="mt-2">Toggle this to see how treasury policies affect miner revenue and total ecosystem funding.</p>
                     </InfoTooltip>
                   </div>
-                  <div className="text-sm text-gray-300">{treasuryEnabled ? "Treasury distributions are enabled where applicable." : "Treasury is disabled (contractFraction = 0)."}</div>
+                  <div className="text-sm text-gray-300">{treasuryEnabled ? "Treasury enabled" : "Treasury disabled"}</div>
                 </div>
                 <button
                   onClick={()=>setTreasuryEnabled(!treasuryEnabled)}
                   className={`px-5 py-2 rounded border ${treasuryEnabled ? "border-amber-400 text-white bg-amber-700/30" : "border-gray-600 text-gray-200 bg-gray-800"}`}
                 >
-                  {treasuryEnabled ? "Treasury: On" : "Treasury: Off"}
+                  {treasuryEnabled ? "On" : "Off"}
                 </button>
               </div>
             </div>
           </div>
 
           <div className="mb-8">
-            <div className="title-font text-xl mb-3 accent">Select Scenarios</div>
+            <div className="title-font text-xl mb-3 accent flex items-center">
+              Select Scenarios
+              <InfoTooltip title="Fee Policy Scenarios">
+                <p>Each scenario represents a different policy for allocating base fee revenue:</p>
+                <ul className="list-disc list-inside mt-2 space-y-1 text-gray-300">
+                  <li><strong>Classic:</strong> All base fees go to miners (pre-treasury approach)</li>
+                  <li><strong>Burn:</strong> All base fees burned (like Ethereum, deflationary)</li>
+                  <li><strong>Olympia:</strong> All base fees to treasury (ecosystem funding)</li>
+                  <li><strong>Blended:</strong> 50/50 split between miners and treasury</li>
+                  <li><strong>ℓ-Smoothed:</strong> Gradual distribution over time for stability</li>
+                </ul>
+                <p className="mt-2">Select multiple scenarios to compare side-by-side.</p>
+              </InfoTooltip>
+            </div>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
               {Object.entries(scenarios).map(([k,s])=>(
-                <ScenarioCard key={k} scenarioKey={k} scenario={s} isSelected={selectedScenarios.includes(k)} onClick={(key)=>toggleScenario(k)}/>
+                <ScenarioCard key={k} scenarioKey={k} scenario={s} isSelected={selectedScenarios.includes(k)} onClick={()=>toggleScenario(k)}/>
               ))}
             </div>
-            <p className="text-sm text-gray-400 mt-2">Compare Classic, Burn, Olympia… toggle the Treasury switch to see differences.</p>
           </div>
 
           <div className="panel greek-key rounded-lg p-6 mb-8">
-            <div className="title-font text-xl mb-4 accent">Simulation Parameters</div>
-
-            <div className="grid lg:grid-cols-2 gap-4">
-              <div className="bg-gray-900/50 rounded p-4 border border-gray-800">
-                <div className="flex items-center justify-between mb-2">
-                  <div className="font-semibold flex items-center">
-                    Starting Era
-                    <InfoTooltip title="Starting Era (ECIP-1017)">
-                      <p className="mb-2">ECIP-1017 reduces the block reward by 20% every 5,000,000 blocks (an era): reward = 5 × 0.8<sup>era</sup>.</p>
-                      <p className="mb-1">Selecting an era sets the starting block to era_start and derives the current supply from the schedule.</p>
-                    </InfoTooltip>
-                  </div>
-                  <div className="text-xs text-gray-400">5,000,000 blocks / era • −20% reward/era</div>
-                </div>
-                <div className="grid grid-cols-3 gap-2">
-                  {[...Array(11).keys()].map((era)=>{
-                    const reward = rewardForEra(era);
-                    return (
-                      <label key={era} className={`flex items-center gap-2 p-2 rounded cursor-pointer border ${selectedEra===era ? "border-emerald-500 bg-emerald-900/20" : "border-gray-700 bg-gray-800 hover:bg-gray-700/40"}`}>
-                        <input type="radio" name="era" value={era} checked={selectedEra===era} onChange={()=>setSelectedEra(era)} />
-                        <span className="text-sm">Era {era} <span className="text-gray-400">({reward.toFixed(3)} ETC)</span></span>
-                      </label>
-                    );
-                  })}
-                </div>
-              </div>
-              <div className="bg-gray-900/50 rounded p-4 border border-gray-800">
-                <div className="font-semibold mb-2">Era Snapshot</div>
-                <div className="grid grid-cols-2 gap-3 text-sm">
-                  <div><div className="text-gray-400">Start Block</div><div className="font-bold">{(selectedEra*5_000_000).toLocaleString()}</div></div>
-                  <div><div className="text-gray-400">End Block</div><div className="font-bold">{(selectedEra*5_000_000 + 4_999_999).toLocaleString()}</div></div>
-                  <div><div className="text-gray-400">Reward / Block</div><div className="font-bold">{rewardForEra(selectedEra).toFixed(4)} ETC</div></div>
-                  <div><div className="text-gray-400">Emission (Era)</div><div className="font-bold">+{(5_000_000*rewardForEra(selectedEra)).toLocaleString()}</div></div>
-                  <div><div className="text-gray-400">Supply @ Start</div><div className="font-bold">{supplyFromHeight(selectedEra*5_000_000).toLocaleString()}</div></div>
-                  <div><div className="text-gray-400">Supply @ End</div><div className="font-bold">{Math.round(supplyFromHeight(selectedEra*5_000_000) + 5_000_000*rewardForEra(selectedEra)).toLocaleString()}</div></div>
-                </div>
-                <div className="mt-2 text-xs text-gray-500">Starting supply is derived from ECIP-1017 at the start of the selected era.</div>
-              </div>
+            <div className="title-font text-xl mb-4 accent flex items-center">
+              Simulation Parameters
+              <InfoTooltip title="How Simulations Work">
+                <p>Adjust these parameters to model different network conditions and measure their impact on revenue distribution.</p>
+                <p className="mt-2"><strong>Era:</strong> ECIP-1017 halves the block reward every 5M blocks (era). Earlier eras have higher rewards.</p>
+                <p className="mt-2"><strong>Demand & Price:</strong> Higher demand means fuller blocks and rising base fees. Price sensitivity (K) controls elasticity.</p>
+                <p className="mt-2"><strong>Length:</strong> Number of blocks to simulate. More blocks = more accurate statistics (but slower).</p>
+              </InfoTooltip>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mt-6">
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
               <div>
-                <div className="flex items-center mb-2">
-                  <label className="text-sm font-medium">Target Block Size (Mgas)</label>
-                  <InfoTooltip title="Target Block Size">
-                    <p>Under EIP-1559, blocks expand/contract around a target. If gas used &gt; target, base fee rises; if &lt; target, base fee falls.</p>
+                <label className="text-sm font-medium flex items-center">
+                  Starting Era
+                  <InfoTooltip title="ECIP-1017 Era Selection">
+                    <p>ECIP-1017 reduces block rewards by 20% every 5,000,000 blocks:</p>
+                    <ul className="list-disc list-inside mt-2 space-y-1 text-gray-300">
+                      <li>Era 0: 5.0 ETC/block</li>
+                      <li>Era 1: 4.0 ETC/block</li>
+                      <li>Era 2: 3.2 ETC/block</li>
+                      <li>...and so on</li>
+                    </ul>
+                    <p className="mt-2">Select an era to see how policies impact supply at different reward levels.</p>
                   </InfoTooltip>
-                </div>
-                <input type="range" min="5" max="30" step="1" value={targetBlockSize} onChange={(e)=>setTargetBlockSize(parseFloat(e.target.value))} className="w-full" style={{accentColor:"var(--etc-green)"}} />
-                <div className="text-right text-sm text-gray-400 mt-1">
-                  {targetBlockSize}M (max: {use1559 ? targetBlockSize*2 : targetBlockSize}M)
-                </div>
+                </label>
+                <select className="w-full bg-gray-900 border border-gray-700 rounded p-2 mt-2" value={selectedEra} onChange={(e)=>setSelectedEra(parseInt(e.target.value))}>
+                  {[...Array(11).keys()].map(era => (
+                    <option key={era} value={era}>Era {era} ({rewardForEra(era).toFixed(3)} ETC/block)</option>
+                  ))}
+                </select>
               </div>
 
               <div>
-                <div className="flex items-center mb-2">
-                  <label className="text-sm font-medium">Baseline Demand (Mgas)</label>
-                  <InfoTooltip title="Baseline Demand">
-                    <p>Average gas demanded by users before pricing effects. Higher demand means fuller blocks and upward pressure on the base fee.</p>
+                <label className="text-sm font-medium flex items-center">
+                  Target Block Size (Mgas)
+                  <InfoTooltip title="Block Size Target">
+                    <p>Under EIP-1559, this is the equilibrium point:</p>
+                    <ul className="list-disc list-inside mt-2 space-y-1 text-gray-300">
+                      <li>Gas used &lt; target: base fee decreases</li>
+                      <li>Gas used = target: base fee stays constant</li>
+                      <li>Gas used &gt; target: base fee increases</li>
+                    </ul>
+                    <p className="mt-2">Blocks can expand to 2x this target when demand is high.</p>
                   </InfoTooltip>
-                </div>
+                </label>
+                <input type="range" min="5" max="30" step="1" value={targetBlockSize} onChange={(e)=>setTargetBlockSize(parseFloat(e.target.value))} className="w-full" style={{accentColor:"var(--etc-green)"}} />
+                <div className="text-right text-sm text-gray-400 mt-1">{targetBlockSize}M (max: {use1559 ? targetBlockSize*2 : targetBlockSize}M)</div>
+              </div>
+
+              <div>
+                <label className="text-sm font-medium flex items-center">
+                  Baseline Demand (Mgas)
+                  <InfoTooltip title="User Demand">
+                    <p>Average gas demanded by users per block before pricing effects.</p>
+                    <p className="mt-2">Higher demand → fuller blocks → higher base fees.</p>
+                    <p className="mt-2">Realistic values: 10-25M gas for moderate network activity.</p>
+                  </InfoTooltip>
+                </label>
                 <input type="range" min="1" max="40" step="1" value={demandLevel} onChange={(e)=>setDemandLevel(parseFloat(e.target.value))} className="w-full" style={{accentColor:"var(--etc-green)"}} />
                 <div className="text-right text-sm text-gray-400 mt-1">{demandLevel}M</div>
               </div>
 
               <div>
-                <div className="flex items-center mb-2">
-                  <label className="text-sm font-medium">Price Sensitivity (gwei)</label>
-                  <InfoTooltip title="Price Sensitivity (K)">
-                    <p>A simple elasticity parameter. As base fee approaches/exceeds K, effective demand shrinks (users defer or batch transactions).</p>
+                <label className="text-sm font-medium flex items-center">
+                  Price Sensitivity (K, gwei)
+                  <InfoTooltip title="Demand Elasticity">
+                    <p>Controls how much demand decreases as price (base fee) increases.</p>
+                    <p className="mt-2">When base fee reaches K, demand drops to 50% of baseline.</p>
+                    <p className="mt-2">Lower K = users more price-sensitive (demand drops faster).</p>
+                    <p className="mt-2">Higher K = users less sensitive (demand sticky).</p>
                   </InfoTooltip>
-                </div>
+                </label>
                 <input type="range" min="10" max="200" step="5" value={priceK} onChange={(e)=>setPriceK(parseFloat(e.target.value))} className="w-full" style={{accentColor:"var(--etc-green)"}} />
                 <div className="text-right text-sm text-gray-400 mt-1">K = {priceK} gwei</div>
               </div>
 
               <div>
-                <div className="flex items-center mb-2">
-                  <label className="text-sm font-medium">Initial Base Fee (gwei)</label>
-                  <InfoTooltip title="Initial Base Fee">
-                    <p>Starting base fee per gas when the simulation begins. It will adjust each block by up to ±12.5% under EIP-1559.</p>
+                <label className="text-sm font-medium flex items-center">
+                  Initial Base Fee (gwei)
+                  <InfoTooltip title="Starting Base Fee">
+                    <p>The base fee at the start of simulation.</p>
+                    <p className="mt-2">It will adjust each block by up to ±12.5% depending on demand.</p>
+                    <p className="mt-2">Realistic values: 10-100 gwei.</p>
                   </InfoTooltip>
-                </div>
-                <input type="range" min="0" max="500" step="1" value={initialBaseFee} onChange={(e)=>setInitialBaseFee(parseFloat(e.target.value))} className="w-full" style={{accentColor:"var(--etc-green)"}} disabled={!use1559} />
-                <div className="text-right text-sm text-gray-400 mt-1">{use1559 ? `${initialBaseFee} gwei` : "N/A (Pre-1559)"}</div>
+                </label>
+                <input type="range" min="0" max="500" step="1" value={initialBaseFee} onChange={(e)=>setInitialBaseFee(parseFloat(e.target.value))} className="w-full" style={{accentColor:"var(--etc-green)"}} />
+                <div className="text-right text-sm text-gray-400 mt-1">{initialBaseFee} gwei</div>
               </div>
 
               <div>
-                <div className="flex items-center mb-2">
-                  <label className="text-sm font-medium">Tips per Gas (gwei)</label>
+                <label className="text-sm font-medium flex items-center">
+                  Tips per Gas (gwei)
                   <InfoTooltip title="Priority Tips">
-                    <p>Tips are paid to miners for priority. Tips are <em>not</em> burned and are always added to miner revenue.</p>
+                    <p>Priority fee (tip) paid by users for fast inclusion.</p>
+                    <p className="mt-2">Tips are <strong>always</strong> given to miners, never burned or sent to treasury.</p>
+                    <p className="mt-2">Realistic values: 1-5 gwei.</p>
                   </InfoTooltip>
-                </div>
+                </label>
                 <input type="range" min="0" max="10" step="0.1" value={tipsGwei} onChange={(e)=>setTipsGwei(parseFloat(e.target.value))} className="w-full" style={{accentColor:"var(--etc-green)"}} />
                 <div className="text-right text-sm text-gray-400 mt-1">{tipsGwei.toFixed(1)} gwei</div>
               </div>
 
-              <div className="md:col-span-2 lg:col-span-3">
-                <div className="flex items-center justify-between mb-2">
-                  <div className="flex items-center gap-2">
-                    <label className="text-sm font-medium">Simulation Length (blocks)</label>
-                    <span className="text-xs text-gray-400">(0 → 5,000,000, max 1 era)</span>
-                    <InfoTooltip title="Simulation Length & Safety">
-                      <p className="mb-2">The run is capped by: your requested blocks, the safety lever, and a hard limit of 1 era (5,000,000 blocks).</p>
-                      <ul className="list-disc list-inside text-gray-300">
-                        <li><strong>500k:</strong> Cap at 500,000 blocks</li>
-                        <li><strong>2.5M:</strong> Cap at 2,500,000 blocks</li>
-                        <li><strong>No Limit:</strong> Only the 1-era cap applies</li>
-                      </ul>
-                    </InfoTooltip>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs text-gray-400">Safety:</span>
-                    <button className={`px-3 py-1 rounded border ${capChoice==="500k"?"border-emerald-500 text-emerald-400":"border-gray-600 text-gray-300 hover:border-gray-400"}`} onClick={()=>setCapChoice("500k")}>500k</button>
-                    <button className={`px-3 py-1 rounded border ${capChoice==="2.5m"?"border-emerald-500 text-emerald-400":"border-gray-600 text-gray-300 hover:border-gray-400"}`} onClick={()=>setCapChoice("2.5m")}>2.5M</button>
-                    <button className={`px-3 py-1 rounded border ${capChoice==="none"?"border-emerald-500 text-emerald-400":"border-gray-600 text-gray-300 hover:border-gray-400"}`} onClick={()=>setCapChoice("none")}>No Limit</button>
-                  </div>
-                </div>
-                <input
-                  type="range" min="0" max="5000000" step="10000"
-                  value={numBlocks}
-                  onChange={(e)=>setNumBlocks(parseInt(e.target.value))}
-                  className="w-full"
-                  style={{accentColor:"var(--etc-green)"}}
-                />
-                <div className="text-right text-sm text-gray-400 mt-1">
-                  Requested: {numBlocks.toLocaleString()} • Safety: {capChoice==="none"?"∞":(capChoice==="2.5m"?"2,500,000":"500,000")}
-                  {' '}• Simulated (≤ 1 era): <span className="text-white font-semibold">
-                    {Math.min(numBlocks, (capChoice==="500k"?500000:capChoice==="2.5m"?2500000:Number.POSITIVE_INFINITY), 5000000).toLocaleString()}
-                  </span>
-                </div>
+              <div>
+                <label className="text-sm font-medium flex items-center">
+                  Simulation Length (blocks)
+                  <InfoTooltip title="Simulation Length">
+                    <p>Number of blocks to simulate. Capped at 1 era (5M blocks) for safety.</p>
+                    <p className="mt-2">More blocks = better statistics but slower computation.</p>
+                    <p className="mt-2">Typical: 100k-500k blocks for good accuracy.</p>
+                  </InfoTooltip>
+                </label>
+                <input type="range" min="0" max="5000000" step="10000" value={numBlocks} onChange={(e)=>setNumBlocks(parseInt(e.target.value))} className="w-full" style={{accentColor:"var(--etc-green)"}} />
+                <div className="text-right text-sm text-gray-400 mt-1">{(numBlocks/1000).toFixed(0)}k blocks</div>
               </div>
 
-              <div className="md:col-span-2 lg:col-span-3 border-t border-gray-800 pt-4">
-                <div className="flex items-center mb-2">
-                  <div className="text-sm font-semibold text-gray-200">Miner Distribution</div>
-                  <InfoTooltip title="Miner Distribution Modes">
-                    <p className="mb-2"><strong>Equal:</strong> Round-robin; 5 miners each ~20% of blocks (illustrates fair share).</p>
-                    <p className="mb-2"><strong>Weighted:</strong> Random with fixed weights 40/30/20/5/5 (illustrates concentration).</p>
-                    <p><strong>Cellular Automaton:</strong> Rule-110 stream hashed to select miners with “churn” windows to show miners entering/exiting over time.</p>
+              <div>
+                <label className="text-sm font-medium flex items-center">
+                  Miner Distribution
+                  <InfoTooltip title="Block Producer Models">
+                    <ul className="list-disc list-inside mt-2 space-y-1 text-gray-300">
+                      <li><strong>Equal:</strong> All 5 miners win ~20% each (fair distribution)</li>
+                      <li><strong>Weighted:</strong> 40/30/20/5/5 distribution (concentration)</li>
+                      <li><strong>Automaton:</strong> Rule-110 cellular automaton (chaotic churn)</li>
+                    </ul>
+                    <p className="mt-2">Compare how concentration affects revenue variance.</p>
                   </InfoTooltip>
-                </div>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  <div>
-                    <label className="text-sm font-medium">Mode</label>
-                    <select className="w-full bg-gray-900 border border-gray-700 rounded p-2 mt-2" value={minerMode} onChange={(e)=>setMinerMode(e.target.value)}>
-                      <option value="equal">Equal (20/20/20/20/20)</option>
-                      <option value="weighted">Weighted (40/30/20/5/5)</option>
-                      <option value="automaton">Cellular Automaton (Rule 110 + churn)</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="text-sm font-medium">Random Seed</label>
-                    <InfoTooltip title="Random Seed">
-                      <p>Controls deterministic randomness for Weighted/Automaton modes. Change to explore different miner sequences.</p>
-                    </InfoTooltip>
-                    <input type="number" className="w-full bg-gray-900 border border-gray-700 rounded p-2 mt-2" value={rngSeed} onChange={(e)=>setRngSeed(parseInt(e.target.value||'1'))}/>
-                    <div className="text-xs text-gray-500 mt-1">For weighted/automaton modes.</div>
-                  </div>
-                </div>
+                </label>
+                <select className="w-full bg-gray-900 border border-gray-700 rounded p-2 mt-2" value={minerMode} onChange={(e)=>setMinerMode(e.target.value)}>
+                  <option value="equal">Equal Distribution</option>
+                  <option value="weighted">Weighted (40/30/20/5/5)</option>
+                  <option value="automaton">Cellular Automaton</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="text-sm font-medium flex items-center">
+                  Random Seed
+                  <InfoTooltip title="Deterministic Randomness">
+                    <p>Seeds the RNG for weighted and automaton modes.</p>
+                    <p className="mt-2">Same seed = same miner sequence (reproducible).</p>
+                    <p className="mt-2">Different seed = different sequence to explore variance.</p>
+                  </InfoTooltip>
+                </label>
+                <input type="number" className="w-full bg-gray-900 border border-gray-700 rounded p-2 mt-2" value={rngSeed} onChange={(e)=>setRngSeed(parseInt(e.target.value||'1'))}/>
               </div>
             </div>
           </div>
@@ -796,46 +649,30 @@
               if (!res) return null;
               return (
                 <div key={k} className="panel greek-key rounded-lg p-6" style={{ borderColor: s.color }}>
-                  <div className="flex items-center gap-3 mb-4">
-                    <span className="w-8 h-8" style={{ color: s.color }}>{React.createElement(s.icon)}</span>
-                    <div>
-                      <h3 className="title-font text-2xl font-bold" style={{ color: s.color }}>{s.name}</h3>
-                      <p className="text-gray-300 text-sm">{s.description}{!treasuryEnabled && s.contractFraction>0 ? " (Treasury disabled)" : ""}</p>
-                    </div>
-                  </div>
+                  <h3 className="title-font text-2xl font-bold mb-4" style={{ color: s.color }}>{s.name}</h3>
 
-                  <div className="bg-emerald-900/15 border border-emerald-700/40 rounded p-3 mb-4">
-                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
-                      <div><div className="text-gray-400">Era</div><div className="font-bold">Era {selectedEra}</div></div>
-                      <div><div className="text-gray-400">Start Block</div><div className="font-bold">{(selectedEra*5_000_000).toLocaleString()}</div></div>
-                      <div><div className="text-gray-400">Reward</div><div className="font-bold">{rewardForEra(selectedEra).toFixed(4)} ETC</div></div>
-                      <div><div className="text-gray-400">Blocks Simulated</div><div className="font-bold">{res.summary.simulatedBlocks.toLocaleString()}</div></div>
-                    </div>
-                    <div className="mt-1 text-xs text-gray-500">Run capped to ≤ 1 era and the selected safety lever.</div>
-                  </div>
-
-                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
                     <RewardFlow keyId={k}/>
                     <SupplyCard keyId={k}/>
                   </div>
 
-                  <div className="mt-6">
+                  <div>
                     <div className="text-sm font-semibold text-gray-200 mb-2">Per-Miner Results</div>
                     <div className="overflow-x-auto">
                       <table className="w-full text-sm">
                         <thead>
                           <tr className="border-b border-gray-800">
-                            <th className="text-left p-2 text-gray-400">Miner</th>
-                            <th className="text-right p-2 text-gray-400">Blocks Won</th>
-                            <th className="text-right p-2 text-gray-400">Avg Rev / Won Block (ETC)</th>
-                            <th className="text-right p-2 text-gray-400">Total Rev (ETC)</th>
+                            <th className="text-left p-2">Miner</th>
+                            <th className="text-right p-2">Blocks Won</th>
+                            <th className="text-right p-2">Avg Revenue (ETC)</th>
+                            <th className="text-right p-2">Total Revenue (ETC)</th>
                           </tr>
                         </thead>
                         <tbody>
                           {res.summary.perMiner.map(r=>(
                             <tr key={r.miner} className="border-b border-gray-900/40">
                               <td className="p-2">Miner {r.miner}</td>
-                              <td className="p-2 text-right">{r.blocksWon.toLocaleString()}</td>
+                              <td className="p-2 text-right">{r.blocksWon}</td>
                               <td className="p-2 text-right">{r.avgRevenuePerWonBlock.toFixed(6)}</td>
                               <td className="p-2 text-right">{r.totalRevenue.toFixed(6)}</td>
                             </tr>
@@ -849,15 +686,25 @@
             })}
           </div>
 
-          {/* Comparison */}
-          <div className="panel greek-key rounded-lg p-6 mt-8">
-            <div className="title-font text-xl mb-4 accent">Side-by-Side Comparison</div>
+          {/* Comparison Table */}
+          <div className="panel greek-key rounded-lg p-6 mt-8 mb-8">
+            <div className="title-font text-xl mb-4 accent flex items-center">
+              Scenario Comparison
+              <InfoTooltip title="Reading the Comparison">
+                <p>This table summarizes key metrics across all selected scenarios.</p>
+                <p className="mt-2"><strong>Avg Miner Revenue:</strong> Average ETC earned per block per miner.</p>
+                <p className="mt-2"><strong>Total Miner Revenue:</strong> Cumulative ETC earned by all miners across all blocks.</p>
+                <p className="mt-2"><strong>Treasury Accumulated:</strong> Total ETC directed to ecosystem treasury.</p>
+                <p className="mt-2"><strong>Supply Change:</strong> Net positive (inflation) or negative (deflation) change to ETC supply.</p>
+                <p className="mt-2">Use this to identify trade-offs between miner incentives, ecosystem funding, and supply dynamics.</p>
+              </InfoTooltip>
+            </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b border-gray-800">
                     <th className="text-left p-3 text-gray-400">Metric</th>
-                    {["classic","olympia","burn","blended","lsmoothed"].filter(k=>selectedScenarios.includes(k)).map(k=>(
+                    {selectedScenarios.map(k=>(
                       <th key={k} className="text-right p-3" style={{ color: scenarios[k].color }}>{scenarios[k].name}</th>
                     ))}
                   </tr>
@@ -870,15 +717,33 @@
                     ))}
                   </tr>
                   <tr className="border-b border-gray-900/40">
-                    <td className="p-3 text-gray-300">Avg Base Fee Collected / Block</td>
+                    <td className="p-3 text-gray-300">Avg Block Reward</td>
+                    {selectedScenarios.map(k=>(
+                      <td key={k} className="text-right p-3">{scenarioResults[k].summary.avgBlockReward.toFixed(6)} ETC</td>
+                    ))}
+                  </tr>
+                  <tr className="border-b border-gray-900/40">
+                    <td className="p-3 text-gray-300">Avg Base Fee / Block</td>
                     {selectedScenarios.map(k=>(
                       <td key={k} className="text-right p-3">{scenarioResults[k].summary.avgBaseFeeRevenue.toFixed(6)} ETC</td>
                     ))}
                   </tr>
                   <tr className="border-b border-gray-900/40">
+                    <td className="p-3 text-gray-300">Avg Tips / Block</td>
+                    {selectedScenarios.map(k=>(
+                      <td key={k} className="text-right p-3">{scenarioResults[k].summary.avgTips.toFixed(6)} ETC</td>
+                    ))}
+                  </tr>
+                  <tr className="border-b border-gray-900/40">
                     <td className="p-3 text-gray-300">Total Miner Revenue</td>
                     {selectedScenarios.map(k=>(
-                      <td key={k} className="text-right p-3 text-sky-300">{scenarioResults[k].summary.totalMinerRevenue.toFixed(4)} ETC</td>
+                      <td key={k} className="text-right p-3 text-sky-300 font-semibold">{scenarioResults[k].summary.totalMinerRevenue.toFixed(4)} ETC</td>
+                    ))}
+                  </tr>
+                  <tr className="border-b border-gray-900/40">
+                    <td className="p-3 text-gray-300">Total Emitted</td>
+                    {selectedScenarios.map(k=>(
+                      <td key={k} className="text-right p-3 text-emerald-300">{scenarioResults[k].summary.totalEmitted.toFixed(4)} ETC</td>
                     ))}
                   </tr>
                   <tr className="border-b border-gray-900/40">
@@ -890,11 +755,17 @@
                   <tr className="border-b border-gray-900/40">
                     <td className="p-3 text-gray-300">Treasury Accumulated</td>
                     {selectedScenarios.map(k=>(
-                      <td key={k} className="text-right p-3 accent">{scenarioResults[k].summary.totalToContract.toFixed(4)} ETC</td>
+                      <td key={k} className="text-right p-3 accent font-semibold">{scenarioResults[k].summary.totalToContract.toFixed(4)} ETC</td>
                     ))}
                   </tr>
                   <tr className="border-b border-gray-900/40">
-                    <td className="p-3 text-gray-300">Total Supply Change</td>
+                    <td className="p-3 text-gray-300">Avg Base Fee (price)</td>
+                    {selectedScenarios.map(k=>(
+                      <td key={k} className="text-right p-3">{scenarioResults[k].summary.avgBaseFee.toFixed(2)} gwei</td>
+                    ))}
+                  </tr>
+                  <tr>
+                    <td className="p-3 text-gray-300 font-semibold">Net Supply Change</td>
                     {selectedScenarios.map(k=>{
                       const ch = scenarioResults[k].summary.netSupplyChange;
                       return (
@@ -906,30 +777,27 @@
                       );
                     })}
                   </tr>
-                  <tr>
-                    <td className="p-3 text-gray-300">Avg Base Fee (price)</td>
-                    {selectedScenarios.map(k=>(
-                      <td key={k} className="text-right p-3">{scenarioResults[k].summary.avgBaseFee.toFixed(2)} gwei</td>
-                    ))}
-                  </tr>
                 </tbody>
               </table>
             </div>
-            <div className="mt-3 text-xs text-gray-400">
-              Run length = min(Requested, Safety Lever, 1 Era).
+            <div className="mt-4 text-xs text-gray-400 space-y-1">
+              <p><strong>Key Insights:</strong></p>
+              <p>• Compare "Total Miner Revenue" to see which scenarios incentivize mining most</p>
+              <p>• Compare "Treasury Accumulated" to see funding potential for ecosystem development</p>
+              <p>• Compare "Net Supply Change" to see deflationary (burn) vs. inflationary (issuance) effects</p>
+              <p>• Compare "Avg Base Fee" to see pricing dynamics and user experience</p>
             </div>
           </div>
 
           <div className="text-center text-gray-400 text-sm border-t border-gray-800 pt-6 mt-8">
-            <p className="mb-1"><strong className="gold">Policy:</strong> ECIP-1017 (5M blocks/era, −20% reward/era). Supply derived from era selection.</p>
-            <p className="mb-1"><strong className="gold">Fees:</strong> EIP-1559 base fee (±12.5%/block) + tips; optional ℓ-smoothing; price-elastic demand.</p>
-            <p className="text-xs text-gray-500 mt-2">Units: gwei × gas × 1e-9 = ETC.</p>
+            <p className="mb-2"><strong className="gold">ECIP-1017 Monetary Policy:</strong> 5M blocks/era, −20% reward reduction per era</p>
+            <p className="text-xs text-gray-500">Units: gwei × gas × 1e-9 = ETC • Made with ❤️ for the ETC community</p>
           </div>
         </div>
       );
     }
 
-    // Render with error capture
+    // Render
     try {
       const root = ReactDOM.createRoot(document.getElementById("root"));
       root.render(<App />);
