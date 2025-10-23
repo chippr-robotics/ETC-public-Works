@@ -1,0 +1,292 @@
+name: ETC Distribution - PR Review
+
+on:
+  pull_request:
+    types: [opened, reopened, edited]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  validate-request:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate Wallet Address
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prBody = context.payload.pull_request.body || '';
+            const prTitle = context.payload.pull_request.title || '';
+            
+            const addressRegex = /0x[a-fA-F0-9]{40}/g;
+            const bodyMatches = prBody.match(addressRegex) || [];
+            const titleMatches = prTitle.match(addressRegex) || [];
+            const allMatches = [...bodyMatches, ...titleMatches];
+            
+            if (allMatches.length === 0) {
+              const comment = `❌ **Validation Failed**
+              
+              No valid Ethereum address found in your PR.
+              
+              Please include your wallet address (0x...) in either:
+              - The PR title
+              - The PR description under "Address:"`;
+              
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: comment
+              });
+              
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ['invalid-address']
+              });
+              
+              core.setFailed('No valid wallet address found');
+              return;
+            }
+            
+            const walletAddress = allMatches[0];
+            
+            const comment = `✅ **Wallet Address Validated**
+            
+            **Address:** \`${walletAddress}\`
+            
+            Your ETC request is awaiting review.
+            
+            **Amount:** Configured in repository settings
+            **Network:** Ethereum Classic Mordor Testnet`;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: comment
+            });
+            
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              labels: ['validated', 'pending-review']
+            });
+
+  send-etc:
+    if: |
+      github.event_name == 'pull_request_review' &&
+      github.event.review.state == 'approved'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          npm init -y
+          npm install ethers@6
+
+      - name: Extract Wallet Address
+        id: extract
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prBody = context.payload.pull_request.body || '';
+            const prTitle = context.payload.pull_request.title || '';
+            
+            const addressRegex = /0x[a-fA-F0-9]{40}/g;
+            const bodyMatches = prBody.match(addressRegex) || [];
+            const titleMatches = prTitle.match(addressRegex) || [];
+            const allMatches = [...bodyMatches, ...titleMatches];
+            
+            if (allMatches.length === 0) {
+              core.setFailed('No wallet address found in PR');
+              return;
+            }
+            
+            const walletAddress = allMatches[0];
+            core.setOutput('wallet_address', walletAddress);
+            return walletAddress;
+
+      - name: Check Previous Distributions
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const walletAddress = '${{ steps.extract.outputs.wallet_address }}';
+            
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number
+            });
+            
+            const alreadySent = comments.some(comment => 
+              comment.body.includes('✅ ETC Sent Successfully') &&
+              comment.body.includes(walletAddress)
+            );
+            
+            if (alreadySent) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: `⚠️ **Already Distributed**
+                
+                ETC has already been sent to \`${walletAddress}\` in this PR.`
+              });
+              
+              core.setFailed('Tokens already sent');
+              return;
+            }
+
+      - name: Send ETC
+        env:
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          RECIPIENT_ADDRESS: ${{ steps.extract.outputs.wallet_address }}
+          ETC_AMOUNT: ${{ vars.ETC_AMOUNT || '0.5' }}
+        run: |
+          cat > send_etc.js << 'EOF'
+          const { ethers } = require('ethers');
+
+          const MORDOR_RPC = 'https://rpc.mordor.etccooperative.org';
+
+          async function main() {
+            try {
+              const privateKey = process.env.PRIVATE_KEY;
+              const recipientAddress = process.env.RECIPIENT_ADDRESS;
+              const etcAmount = process.env.ETC_AMOUNT || '0.5';
+
+              if (!privateKey) {
+                throw new Error('PRIVATE_KEY not found');
+              }
+
+              if (!recipientAddress || !recipientAddress.match(/^0x[a-fA-F0-9]{40}$/)) {
+                throw new Error('Invalid recipient address');
+              }
+
+              console.log('Connecting to Mordor testnet...');
+              const provider = new ethers.JsonRpcProvider(MORDOR_RPC);
+              const wallet = new ethers.Wallet(privateKey, provider);
+
+              console.log(`Sender: ${wallet.address}`);
+              console.log(`Recipient: ${recipientAddress}`);
+
+              // Check sender balance
+              const senderBalance = await provider.getBalance(wallet.address);
+              console.log(`Sender balance: ${ethers.formatEther(senderBalance)} ETC`);
+
+              // Amount to send
+              const amountToSend = ethers.parseEther(etcAmount);
+              
+              // Reserve for gas
+              const gasReserve = ethers.parseEther('0.001');
+              
+              if (senderBalance < amountToSend + gasReserve) {
+                throw new Error(`Insufficient balance. Have: ${ethers.formatEther(senderBalance)}, Need: ${etcAmount} + gas`);
+              }
+
+              console.log(`Sending ${etcAmount} ETC...`);
+
+              // Send transaction
+              const tx = await wallet.sendTransaction({
+                to: recipientAddress,
+                value: amountToSend
+              });
+
+              console.log(`Transaction hash: ${tx.hash}`);
+              console.log('Waiting for confirmation...');
+
+              const receipt = await tx.wait();
+              console.log(`Confirmed in block ${receipt.blockNumber}`);
+              console.log(`Gas used: ${receipt.gasUsed.toString()}`);
+
+              // Check recipient balance
+              const recipientBalance = await provider.getBalance(recipientAddress);
+              console.log(`Recipient balance: ${ethers.formatEther(recipientBalance)} ETC`);
+
+              console.log('\n=== SUCCESS ===');
+              console.log(`TX_HASH=${tx.hash}`);
+              console.log(`BLOCK=${receipt.blockNumber}`);
+              console.log(`AMOUNT=${etcAmount}`);
+
+            } catch (error) {
+              console.error('\n=== FAILED ===');
+              console.error(`ERROR=${error.message}`);
+              process.exit(1);
+            }
+          }
+
+          main();
+          EOF
+
+          node send_etc.js
+
+      - name: Comment Success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const walletAddress = '${{ steps.extract.outputs.wallet_address }}';
+            const etcAmount = '${{ vars.ETC_AMOUNT || '0.5' }}';
+            
+            const comment = `✅ **ETC Sent Successfully!**
+            
+            **Recipient:** \`${walletAddress}\`
+            **Amount:** ${etcAmount} ETC
+            **Network:** Ethereum Classic Mordor Testnet
+            
+            [View on Blockscout](https://etc-mordor.blockscout.com/address/${walletAddress})
+            
+            You can now use these tokens for testing. This PR can be closed.`;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: comment
+            });
+            
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              name: 'pending-review'
+            }).catch(() => {});
+            
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              labels: ['tokens-sent']
+            });
+
+      - name: Comment Failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = `❌ **Distribution Failed**
+            
+            The ETC distribution encountered an error. Check the workflow logs.
+            
+            A maintainer will investigate.`;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: comment
+            });

@@ -1,0 +1,393 @@
+name: Token Distribution - PR Review
+
+on:
+  pull_request:
+    types: [opened, reopened, edited]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  validate-request:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate Wallet Address
+        id: validate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prBody = context.payload.pull_request.body || '';
+            const prTitle = context.payload.pull_request.title || '';
+            
+            // Extract wallet address from PR body or title
+            const addressRegex = /0x[a-fA-F0-9]{40}/g;
+            const bodyMatches = prBody.match(addressRegex) || [];
+            const titleMatches = prTitle.match(addressRegex) || [];
+            const allMatches = [...bodyMatches, ...titleMatches];
+            
+            if (allMatches.length === 0) {
+              const comment = `❌ **Validation Failed**
+              
+              No valid Ethereum address found in your PR.
+              
+              Please include your wallet address (0x...) in either:
+              - The PR title
+              - The PR description under "Address:"
+              
+              Format: \`0x\` followed by 40 hexadecimal characters
+              Example: \`0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb\``;
+              
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: comment
+              });
+              
+              // Add label
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ['invalid-address']
+              });
+              
+              core.setFailed('No valid wallet address found');
+              return;
+            }
+            
+            const walletAddress = allMatches[0];
+            
+            if (allMatches.length > 1) {
+              const comment = `⚠️ **Multiple Addresses Detected**
+              
+              Found ${allMatches.length} addresses in your PR:
+              ${allMatches.map(addr => `- \`${addr}\``).join('\n')}
+              
+              Using the first address: \`${walletAddress}\`
+              
+              If this is incorrect, please edit your PR to include only one address.`;
+              
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: comment
+              });
+            }
+            
+            // Validation successful
+            const comment = `✅ **Wallet Address Validated**
+            
+            **Address:** \`${walletAddress}\`
+            
+            Your token request has been validated and is awaiting review.
+            
+            ---
+            **Next Steps:**
+            - A maintainer will review your request
+            - Upon approval, tokens will be automatically sent to your address
+            - You can track the transaction in the PR comments
+            
+            **Amount to be sent:** Configured amount (check repository settings)
+            **Network:** Ethereum Classic Mordor Testnet`;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: comment
+            });
+            
+            // Add label
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              labels: ['validated', 'pending-review']
+            });
+            
+            // Remove invalid label if it exists
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                name: 'invalid-address'
+              });
+            } catch (error) {
+              // Label might not exist, ignore
+            }
+            
+            core.setOutput('wallet_address', walletAddress);
+            console.log(`Validated wallet address: ${walletAddress}`);
+
+  send-tokens:
+    if: |
+      github.event_name == 'pull_request_review' &&
+      github.event.review.state == 'approved'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          npm init -y
+          npm install ethers@6
+
+      - name: Extract Wallet Address
+        id: extract
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prBody = context.payload.pull_request.body || '';
+            const prTitle = context.payload.pull_request.title || '';
+            
+            const addressRegex = /0x[a-fA-F0-9]{40}/g;
+            const bodyMatches = prBody.match(addressRegex) || [];
+            const titleMatches = prTitle.match(addressRegex) || [];
+            const allMatches = [...bodyMatches, ...titleMatches];
+            
+            if (allMatches.length === 0) {
+              core.setFailed('No wallet address found in PR');
+              return;
+            }
+            
+            const walletAddress = allMatches[0];
+            core.setOutput('wallet_address', walletAddress);
+            console.log(`Extracted wallet address: ${walletAddress}`);
+            
+            return walletAddress;
+
+      - name: Check Previous Distributions
+        id: check_history
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const walletAddress = '${{ steps.extract.outputs.wallet_address }}';
+            const prAuthor = context.payload.pull_request.user.login;
+            
+            // Check if this address has already received tokens
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number
+            });
+            
+            const alreadySent = comments.some(comment => 
+              comment.body.includes('✅ Tokens Sent Successfully') &&
+              comment.body.includes(walletAddress)
+            );
+            
+            if (alreadySent) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: `⚠️ **Tokens Already Sent**
+                
+                Tokens have already been sent to address \`${walletAddress}\` in this PR.
+                To prevent duplicate distributions, this request is being skipped.`
+              });
+              
+              core.setFailed('Tokens already sent to this address');
+              return;
+            }
+            
+            console.log('No previous distribution found, proceeding...');
+
+      - name: Send Tokens
+        env:
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          RECIPIENT_ADDRESS: ${{ steps.extract.outputs.wallet_address }}
+          TOKEN_AMOUNT: ${{ vars.TOKEN_AMOUNT || '1.0' }}
+        run: |
+          cat > send_tokens.js << 'EOF'
+          const { ethers } = require('ethers');
+
+          // Mordor testnet configuration
+          const MORDOR_RPC = 'https://rpc.mordor.etccooperative.org';
+          const WETC_ADDRESS = '0x1953cab0E5bFa6D4a9BaD6E05fD46C1CC6527a5a';
+          
+          // ERC20 ABI for transfer
+          const ERC20_ABI = [
+            'function transfer(address to, uint256 amount) returns (bool)',
+            'function balanceOf(address) view returns (uint256)',
+            'function decimals() view returns (uint8)',
+            'function symbol() view returns (string)',
+            'event Transfer(address indexed from, address indexed to, uint256 value)'
+          ];
+
+          async function main() {
+            try {
+              const privateKey = process.env.PRIVATE_KEY;
+              const recipientAddress = process.env.RECIPIENT_ADDRESS;
+              const tokenAmount = process.env.TOKEN_AMOUNT || '1.0';
+
+              if (!privateKey) {
+                throw new Error('PRIVATE_KEY not found');
+              }
+
+              if (!recipientAddress || !recipientAddress.match(/^0x[a-fA-F0-9]{40}$/)) {
+                throw new Error('Invalid recipient address');
+              }
+
+              console.log('Connecting to Mordor testnet...');
+              const provider = new ethers.JsonRpcProvider(MORDOR_RPC);
+              const wallet = new ethers.Wallet(privateKey, provider);
+
+              console.log(`Sender address: ${wallet.address}`);
+              console.log(`Recipient address: ${recipientAddress}`);
+
+              // Connect to WETC contract
+              const wetcContract = new ethers.Contract(WETC_ADDRESS, ERC20_ABI, wallet);
+
+              // Get token info
+              const symbol = await wetcContract.symbol();
+              const decimals = await wetcContract.decimals();
+              console.log(`Token: ${symbol}, Decimals: ${decimals}`);
+
+              // Check sender balance
+              const senderBalance = await wetcContract.balanceOf(wallet.address);
+              console.log(`Sender ${symbol} balance: ${ethers.formatUnits(senderBalance, decimals)}`);
+
+              // Calculate amount to send
+              const amountToSend = ethers.parseUnits(tokenAmount, decimals);
+              
+              if (senderBalance < amountToSend) {
+                throw new Error(`Insufficient balance. Have: ${ethers.formatUnits(senderBalance, decimals)}, Need: ${tokenAmount}`);
+              }
+
+              console.log(`Sending ${tokenAmount} ${symbol} to ${recipientAddress}...`);
+
+              // Send tokens
+              const tx = await wetcContract.transfer(recipientAddress, amountToSend);
+              console.log(`Transaction hash: ${tx.hash}`);
+              console.log('Waiting for confirmation...');
+
+              const receipt = await tx.wait();
+              console.log(`Transaction confirmed in block ${receipt.blockNumber}`);
+              console.log(`Gas used: ${receipt.gasUsed.toString()}`);
+
+              // Check recipient balance
+              const recipientBalance = await wetcContract.balanceOf(recipientAddress);
+              console.log(`Recipient new balance: ${ethers.formatUnits(recipientBalance, decimals)} ${symbol}`);
+
+              // Output for GitHub Actions
+              console.log('\n=== TRANSACTION_SUCCESS ===');
+              console.log(`TX_HASH=${tx.hash}`);
+              console.log(`BLOCK=${receipt.blockNumber}`);
+              console.log(`AMOUNT=${tokenAmount}`);
+              console.log(`RECIPIENT=${recipientAddress}`);
+              console.log(`SYMBOL=${symbol}`);
+
+            } catch (error) {
+              console.error('\n=== TRANSACTION_FAILED ===');
+              console.error(`ERROR=${error.message}`);
+              process.exit(1);
+            }
+          }
+
+          main();
+          EOF
+
+          node send_tokens.js
+
+      - name: Comment on PR with Success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const walletAddress = '${{ steps.extract.outputs.wallet_address }}';
+            const tokenAmount = '${{ vars.TOKEN_AMOUNT || '1.0' }}';
+            
+            // Extract transaction details from logs (if available)
+            const comment = `✅ **Tokens Sent Successfully!**
+            
+            **Recipient:** \`${walletAddress}\`
+            **Amount:** ${tokenAmount} WETC
+            **Network:** Ethereum Classic Mordor Testnet
+            
+            ---
+            
+            **View your transaction:**
+            - Check your wallet balance
+            - View on [Blockscout](https://etc-mordor.blockscout.com/address/${walletAddress})
+            
+            **Next Steps:**
+            - You can now use these tokens for testing
+            - View the WETC token: [0x1953cab0E5bFa6D4a9BaD6E05fD46C1CC6527a5a](https://etc-mordor.blockscout.com/token/0x1953cab0E5bFa6D4a9BaD6E05fD46C1CC6527a5a)
+            
+            Thank you for participating! This PR can now be closed.`;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: comment
+            });
+            
+            // Update labels
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              name: 'pending-review'
+            }).catch(() => {});
+            
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              labels: ['tokens-sent']
+            });
+
+      - name: Comment on PR with Failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const walletAddress = '${{ steps.extract.outputs.wallet_address }}';
+            
+            const comment = `❌ **Token Distribution Failed**
+            
+            **Recipient:** \`${walletAddress}\`
+            
+            The token distribution encountered an error. Please check the workflow logs for details.
+            
+            Common issues:
+            - Insufficient balance in distribution wallet
+            - Network connectivity issues
+            - Invalid wallet address format
+            
+            A maintainer will investigate and retry if necessary.`;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: comment
+            });
+            
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              labels: ['distribution-failed']
+            });
