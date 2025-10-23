@@ -1,0 +1,134 @@
+name: Wrap ETC to WETC
+
+on:
+  workflow_dispatch:
+    inputs:
+      percentage:
+        description: 'Percentage of balance to wrap (default: 10)'
+        required: false
+        default: '10'
+        type: string
+
+jobs:
+  wrap-etc:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          npm init -y
+          npm install ethers@6
+
+      - name: Wrap ETC to WETC
+        env:
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          PERCENTAGE: ${{ github.event.inputs.percentage || '10' }}
+        run: |
+          cat > wrap.js << 'EOF'
+          const { ethers } = require('ethers');
+
+          // Mordor testnet configuration
+          const MORDOR_RPC = 'https://rpc.mordor.etccooperative.org';
+          const WETC_ADDRESS = '0x1953cab0E5bFa6D4a9BaD6E05fD46C1CC6527a5a';
+          
+          // WETH9 ABI (only the functions we need)
+          const WETC_ABI = [
+            'function deposit() payable',
+            'function balanceOf(address) view returns (uint256)',
+            'function withdraw(uint256)',
+            'event Deposit(address indexed dst, uint256 wad)',
+            'event Withdrawal(address indexed src, uint256 wad)'
+          ];
+
+          async function main() {
+            try {
+              // Validate private key
+              const privateKey = process.env.PRIVATE_KEY;
+              if (!privateKey) {
+                throw new Error('PRIVATE_KEY not found in environment');
+              }
+
+              // Connect to Mordor testnet
+              console.log('Connecting to Mordor testnet...');
+              const provider = new ethers.JsonRpcProvider(MORDOR_RPC);
+              const wallet = new ethers.Wallet(privateKey, provider);
+              
+              console.log(`Wallet address: ${wallet.address}`);
+
+              // Get current network
+              const network = await provider.getNetwork();
+              console.log(`Connected to network: ${network.name} (Chain ID: ${network.chainId})`);
+
+              // Get account balance
+              const balance = await provider.getBalance(wallet.address);
+              console.log(`Current ETC balance: ${ethers.formatEther(balance)} ETC`);
+
+              // Calculate amount to wrap (percentage of balance)
+              const percentage = parseFloat(process.env.PERCENTAGE || '10');
+              if (percentage <= 0 || percentage > 100) {
+                throw new Error('Percentage must be between 0 and 100');
+              }
+              
+              const amountToWrap = (balance * BigInt(Math.floor(percentage * 100))) / 10000n;
+              
+              // Reserve some ETC for gas fees (0.001 ETC)
+              const gasReserve = ethers.parseEther('0.001');
+              if (amountToWrap > balance - gasReserve) {
+                throw new Error('Insufficient balance to wrap (need to reserve gas for transaction)');
+              }
+
+              console.log(`Amount to wrap: ${ethers.formatEther(amountToWrap)} ETC (${percentage}%)`);
+
+              // Connect to WETC contract
+              const wetcContract = new ethers.Contract(WETC_ADDRESS, WETC_ABI, wallet);
+
+              // Check current WETC balance
+              const wetcBalanceBefore = await wetcContract.balanceOf(wallet.address);
+              console.log(`Current WETC balance: ${ethers.formatEther(wetcBalanceBefore)} WETC`);
+
+              // Estimate gas
+              const gasEstimate = await wetcContract.deposit.estimateGas({ value: amountToWrap });
+              console.log(`Estimated gas: ${gasEstimate.toString()}`);
+
+              // Execute wrap transaction
+              console.log('Sending wrap transaction...');
+              const tx = await wetcContract.deposit({ 
+                value: amountToWrap,
+                gasLimit: gasEstimate * 120n / 100n // Add 20% buffer
+              });
+              
+              console.log(`Transaction hash: ${tx.hash}`);
+              console.log('Waiting for confirmation...');
+
+              const receipt = await tx.wait();
+              console.log(`Transaction confirmed in block ${receipt.blockNumber}`);
+              console.log(`Gas used: ${receipt.gasUsed.toString()}`);
+
+              // Check new balances
+              const newBalance = await provider.getBalance(wallet.address);
+              const wetcBalanceAfter = await wetcContract.balanceOf(wallet.address);
+
+              console.log('\n=== Transaction Summary ===');
+              console.log(`ETC Balance: ${ethers.formatEther(balance)} → ${ethers.formatEther(newBalance)}`);
+              console.log(`WETC Balance: ${ethers.formatEther(wetcBalanceBefore)} → ${ethers.formatEther(wetcBalanceAfter)}`);
+              console.log(`Wrapped: ${ethers.formatEther(amountToWrap)} ETC`);
+              console.log('=========================');
+
+            } catch (error) {
+              console.error('Error wrapping ETC:', error.message);
+              process.exit(1);
+            }
+          }
+
+          main();
+          EOF
+
+          node wrap.js

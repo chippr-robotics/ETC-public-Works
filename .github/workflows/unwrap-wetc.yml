@@ -1,0 +1,139 @@
+name: Unwrap WETC to ETC
+
+on:
+  workflow_dispatch:
+    inputs:
+      amount:
+        description: 'Amount to unwrap in WETC (leave empty to unwrap all)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  unwrap-wetc:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          npm init -y
+          npm install ethers@6
+
+      - name: Unwrap WETC to ETC
+        env:
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          AMOUNT: ${{ github.event.inputs.amount }}
+        run: |
+          cat > unwrap.js << 'EOF'
+          const { ethers } = require('ethers');
+
+          // Mordor testnet configuration
+          const MORDOR_RPC = 'https://rpc.mordor.etccooperative.org';
+          const WETC_ADDRESS = '0x1953cab0E5bFa6D4a9BaD6E05fD46C1CC6527a5a';
+          
+          // WETH9 ABI (only the functions we need)
+          const WETC_ABI = [
+            'function deposit() payable',
+            'function balanceOf(address) view returns (uint256)',
+            'function withdraw(uint256)',
+            'event Deposit(address indexed dst, uint256 wad)',
+            'event Withdrawal(address indexed src, uint256 wad)'
+          ];
+
+          async function main() {
+            try {
+              // Validate private key
+              const privateKey = process.env.PRIVATE_KEY;
+              if (!privateKey) {
+                throw new Error('PRIVATE_KEY not found in environment');
+              }
+
+              // Connect to Mordor testnet
+              console.log('Connecting to Mordor testnet...');
+              const provider = new ethers.JsonRpcProvider(MORDOR_RPC);
+              const wallet = new ethers.Wallet(privateKey, provider);
+              
+              console.log(`Wallet address: ${wallet.address}`);
+
+              // Get current network
+              const network = await provider.getNetwork();
+              console.log(`Connected to network: ${network.name} (Chain ID: ${network.chainId})`);
+
+              // Connect to WETC contract
+              const wetcContract = new ethers.Contract(WETC_ADDRESS, WETC_ABI, wallet);
+
+              // Get current balances
+              const etcBalance = await provider.getBalance(wallet.address);
+              const wetcBalance = await wetcContract.balanceOf(wallet.address);
+              
+              console.log(`Current ETC balance: ${ethers.formatEther(etcBalance)} ETC`);
+              console.log(`Current WETC balance: ${ethers.formatEther(wetcBalance)} WETC`);
+
+              // Determine amount to unwrap
+              let amountToUnwrap;
+              const inputAmount = process.env.AMOUNT?.trim();
+              
+              if (!inputAmount || inputAmount === '') {
+                // Unwrap all WETC
+                amountToUnwrap = wetcBalance;
+                console.log('Unwrapping all WETC...');
+              } else {
+                // Unwrap specified amount
+                amountToUnwrap = ethers.parseEther(inputAmount);
+                console.log(`Unwrapping ${ethers.formatEther(amountToUnwrap)} WETC...`);
+              }
+
+              if (amountToUnwrap === 0n) {
+                console.log('No WETC to unwrap. Exiting.');
+                return;
+              }
+
+              if (amountToUnwrap > wetcBalance) {
+                throw new Error(`Insufficient WETC balance. Requested: ${ethers.formatEther(amountToUnwrap)}, Available: ${ethers.formatEther(wetcBalance)}`);
+              }
+
+              // Estimate gas
+              const gasEstimate = await wetcContract.withdraw.estimateGas(amountToUnwrap);
+              console.log(`Estimated gas: ${gasEstimate.toString()}`);
+
+              // Execute unwrap transaction
+              console.log('Sending unwrap transaction...');
+              const tx = await wetcContract.withdraw(amountToUnwrap, {
+                gasLimit: gasEstimate * 120n / 100n // Add 20% buffer
+              });
+              
+              console.log(`Transaction hash: ${tx.hash}`);
+              console.log('Waiting for confirmation...');
+
+              const receipt = await tx.wait();
+              console.log(`Transaction confirmed in block ${receipt.blockNumber}`);
+              console.log(`Gas used: ${receipt.gasUsed.toString()}`);
+
+              // Check new balances
+              const newEtcBalance = await provider.getBalance(wallet.address);
+              const newWetcBalance = await wetcContract.balanceOf(wallet.address);
+
+              console.log('\n=== Transaction Summary ===');
+              console.log(`ETC Balance: ${ethers.formatEther(etcBalance)} → ${ethers.formatEther(newEtcBalance)}`);
+              console.log(`WETC Balance: ${ethers.formatEther(wetcBalance)} → ${ethers.formatEther(newWetcBalance)}`);
+              console.log(`Unwrapped: ${ethers.formatEther(amountToUnwrap)} WETC`);
+              console.log('=========================');
+
+            } catch (error) {
+              console.error('Error unwrapping WETC:', error.message);
+              process.exit(1);
+            }
+          }
+
+          main();
+          EOF
+
+          node unwrap.js
